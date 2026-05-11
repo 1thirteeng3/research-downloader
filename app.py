@@ -74,5 +74,6 @@ if uploaded_file is not None:
     if st.sidebar.button("Run Batch Download"):
         for q in queries:
             st.session_state.messages.append({"role": "user", "content": f"*(Batch)* {q}"})
+            with st.chat_message("user"):
+                st.markdown(f"*(Batch)* {q}")
             run_agent(q)
-            st.rerun()
