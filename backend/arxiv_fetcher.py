@@ -1,5 +1,6 @@
 import arxiv
 import os
+import time
 from organizer import organize_paper
 
 def download_from_arxiv(query=None, max_results=3, arxiv_id=None):
@@ -22,11 +23,26 @@ def download_from_arxiv(query=None, max_results=3, arxiv_id=None):
     tmp_dir = os.path.join(os.path.expanduser("~"), ".research_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    try:
-        results = list(client.results(search))
-    except Exception as e:
-        print(f"Error fetching from arXiv: {e}")
+    results = []
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            results = list(client.results(search))
+            break
+        except Exception as e:
+            if "429" in str(e):
+                wait_time = (2 ** attempt) * 5
+                print(f"Rate limited (HTTP 429). Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"Error fetching from arXiv: {e}")
+                return
+    else:
+        print("Max retries reached. Skipping this item.")
         return
+
+    # Respect arXiv's API rate limits
+    time.sleep(3)
 
     if not results:
         print("No results found.")
