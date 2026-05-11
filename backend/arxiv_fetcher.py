@@ -19,7 +19,7 @@ def download_from_arxiv(query=None, max_results=3, arxiv_id=None):
         print("Error: Must provide either a query or an arxiv_id.")
         return
 
-    tmp_dir = "/home/.z/workspaces/research_tmp"
+    tmp_dir = os.path.join(os.path.expanduser("~"), ".research_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
     try:
@@ -41,7 +41,8 @@ def download_from_arxiv(query=None, max_results=3, arxiv_id=None):
         
         # Download to tmp
         print("Downloading PDF...")
-        tmp_filename = f"{paper.get_short_id()}.pdf"
+        safe_id = paper.get_short_id().replace('/', '_')
+        tmp_filename = f"{safe_id}.pdf"
         tmp_path = os.path.join(tmp_dir, tmp_filename)
         
         try:

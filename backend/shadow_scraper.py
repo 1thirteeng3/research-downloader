@@ -53,7 +53,7 @@ def download_from_annas_archive(query, max_results=3, lang=""):
                 
         print(f"Found {len(md5_links)} books.")
         
-        tmp_dir = "/home/.z/workspaces/research_tmp"
+        tmp_dir = os.path.join(os.path.expanduser("~"), ".research_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         
         for md5 in md5_links:

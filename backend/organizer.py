@@ -2,7 +2,7 @@ import os
 import re
 import shutil
 
-BASE_DIR = "/home/workspace/SecondBrain/Literature"
+BASE_DIR = os.path.join(os.path.expanduser("~"), "SecondBrain", "Literature")
 
 def sanitize_filename(name):
     # Remove invalid filename characters
