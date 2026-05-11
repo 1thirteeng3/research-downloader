@@ -316,7 +316,7 @@ def download_from_scihub(doi: str) -> FetchResult:
     return FetchResult(
         success=bool(downloaded_paths),
         paths=downloaded_paths,
-        error=f"All {len(_SCIHUB_MIRRORS)} Sci-Hub mirrors failed. Errors: {' | '.join(errors[:3']}" if errors else "Unknown error",
+        error=f"All {len(_SCIHUB_MIRRORS)} Sci-Hub mirrors failed. Errors: {' | '.join(errors[:3])}" if errors else "Unknown error",
         source="scihub",
     )
 
