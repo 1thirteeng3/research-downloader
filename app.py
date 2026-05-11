@@ -18,6 +18,13 @@ for msg in st.session_state.messages:
 
 # File uploader for batch queries
 with st.sidebar:
+    st.header("Agent Settings")
+    agent_mode = st.radio("Execution Mode", ["Heuristic (Fast)", "ReAct Agent (Smart)"])
+    api_key = ""
+    if agent_mode == "ReAct Agent (Smart)":
+        api_key = st.text_input("OpenAI API Key", type="password", help="Required for the intelligent agent to route requests automatically.")
+        
+    st.divider()
     st.header("Batch Upload")
     uploaded_file = st.file_uploader("Upload a .txt file with queries (one per line)", type=["txt"])
     max_results = st.number_input("Max results per query", min_value=1, max_value=10, value=3)
@@ -40,20 +47,30 @@ def extract_arxiv_id(text):
     return None
 
 def run_agent(query):
-    # Heuristic parsing of the prompt
-    source = "anna" if "lacan" in query.lower() or "anna" in query.lower() or "book" in query.lower() else "arxiv"
-    
-    arxiv_id = extract_arxiv_id(query)
-    if arxiv_id and source == "arxiv":
-        cmd = ["python", "backend/main.py", "--arxiv-id", arxiv_id]
-        st.session_state.messages.append({"role": "assistant", "content": f"Extracted arXiv ID: `{arxiv_id}`. Downloading..."})
+    if agent_mode == "ReAct Agent (Smart)":
+        if not api_key:
+            st.error("Please provide an OpenAI API Key in the sidebar for ReAct mode.")
+            return
+            
+        cmd = ["python", "backend/main.py", "--mode", "react", "--api-key", api_key, "--query", query, "--max-results", str(max_results)]
+        st.session_state.messages.append({"role": "assistant", "content": f"🧠 Reasoning about: `{query}`..."})
         with st.chat_message("assistant"):
-            st.markdown(f"Extracted arXiv ID: `{arxiv_id}`. Downloading...")
+            st.markdown(f"🧠 Reasoning about: `{query}`...")
     else:
-        cmd = ["python", "backend/main.py", "--query", query, "--source", source, "--max-results", str(max_results)]
-        st.session_state.messages.append({"role": "assistant", "content": f"Running search on **{source.upper()}** for: `{query}`..."})
-        with st.chat_message("assistant"):
-            st.markdown(f"Running search on **{source.upper()}** for: `{query}`...")
+        # Heuristic parsing of the prompt
+        source = "anna" if "lacan" in query.lower() or "anna" in query.lower() or "book" in query.lower() else "arxiv"
+        
+        arxiv_id = extract_arxiv_id(query)
+        if arxiv_id and source == "arxiv":
+            cmd = ["python", "backend/main.py", "--arxiv-id", arxiv_id]
+            st.session_state.messages.append({"role": "assistant", "content": f"Extracted arXiv ID: `{arxiv_id}`. Downloading..."})
+            with st.chat_message("assistant"):
+                st.markdown(f"Extracted arXiv ID: `{arxiv_id}`. Downloading...")
+        else:
+            cmd = ["python", "backend/main.py", "--query", query, "--source", source, "--max-results", str(max_results)]
+            st.session_state.messages.append({"role": "assistant", "content": f"Running search on **{source.upper()}** for: `{query}`..."})
+            with st.chat_message("assistant"):
+                st.markdown(f"Running search on **{source.upper()}** for: `{query}`...")
             
     with st.chat_message("assistant"):
         with st.spinner("Downloading... This might take a while."):

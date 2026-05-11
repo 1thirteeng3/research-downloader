@@ -4,3 +4,4 @@ pypdf>=6.11.0
 requests>=2.32.0
 beautifulsoup4>=4.12.3
 playwright>=1.52.0
+openai>=1.0.0
