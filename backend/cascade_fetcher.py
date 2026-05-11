@@ -289,19 +289,28 @@ def run_cascade_react(
     query: str,
     api_key: str,
     model: str = "gpt-4o",
+    provider: str = "openai",  # "openai" | "deepseek"
     max_results: int = 3,
     verbose: bool = False,
 ) -> FetchResult:
     """
     ReAct loop: the LLM plans actions, executes tools, and loops until done.
-    Uses openai SDK directly.
+    Supports OpenAI and DeepSeek as LLM providers.
     """
     try:
         from openai import OpenAI
     except ImportError:
         return FetchResult(False, [], "openai package not installed. Run: pip install openai")
 
-    client = OpenAI(api_key=api_key)
+    # DeepSeek uses OpenAI SDK with a different base URL
+    if provider == "deepseek":
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        if not model or model == "gpt-4o":
+            model = "deepseek-chat"
+    else:
+        client = OpenAI(api_key=api_key)
+        if not model:
+            model = "gpt-4o"
 
     # Pre-normalize the user's raw input
     clean_query, pre_arxiv_id, pre_doi = normalize_query(query)

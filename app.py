@@ -141,19 +141,36 @@ with st.sidebar:
     # API Key (only needed for ReAct)
     api_key = ""
     if is_react:
+        provider = st.selectbox(
+            "🌐 Provider",
+            ["OpenAI", "DeepSeek"],
+            help="Escolha o provedor de API LLM."
+        )
         api_key = st.text_input(
-            "🔑 OpenAI API Key",
+            "🔑 API Key",
             type="password",
-            help="Necesária apenas para o modo ReAct. A chave é usada diretamente, não armazenada."
+            help=f"Necesária apenas para o modo ReAct com provider {provider}."
         )
         if not api_key:
             st.warning("⚠️ Insira sua API Key para usar o modo ReAct.")
             st.stop()
-        model_name = st.selectbox(
-            "🤖 Modelo",
-            ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
-            index=0
-        )
+
+        if provider == "DeepSeek":
+            model_name = st.selectbox(
+                "🤖 Modelo",
+                ["deepseek-chat"],
+                index=0
+            )
+            st.session_state["llm_provider"] = "deepseek"
+            st.session_state["deepseek_key"] = api_key
+        else:
+            model_name = st.selectbox(
+                "🤖 Modelo",
+                ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+                index=0
+            )
+            st.session_state["llm_provider"] = "openai"
+            st.session_state["openai_key"] = api_key
     else:
         model_name = None
 
@@ -317,6 +334,7 @@ if submitted:
                         query=qvalue,
                         api_key=api_key,
                         model=model_name,
+                        provider=st.session_state.get("llm_provider", "openai"),
                         max_results=max_results,
                         verbose=True,
                     )
