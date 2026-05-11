@@ -29,12 +29,12 @@ def extract_arxiv_id(text):
     m = re.search(r'(\d{4}\.\d{4,5}(?:v\d+)?)', text)
     if m: return m.group(1)
     
-    # Try old format: hep-th/0411247
-    m = re.search(r'([a-zA-Z\-]+(?:\.[a-zA-Z\-]+)?/\d{7}(?:v\d+)?)', text)
-    if m: return m.group(1)
+    # Try old format: hep-th/0411247 or math.DG/0611259 -> math/0611259
+    m = re.search(r'([a-zA-Z\-]+)(?:\.[a-zA-Z\-]+)?/(\d{7}(?:v\d+)?)', text)
+    if m: return f"{m.group(1)}/{m.group(2)}"
     
     # Try PS_cache format: hep-th/pdf/0411/0411247v2.pdf -> hep-th/0411247v2
-    m = re.search(r'([a-zA-Z\-]+(?:\.[a-zA-Z\-]+)?)/pdf/\d{4}/(\d{7}(?:v\d+)?)', text)
+    m = re.search(r'([a-zA-Z\-]+)(?:\.[a-zA-Z\-]+)?/pdf/\d{4}/(\d{7}(?:v\d+)?)', text)
     if m: return f"{m.group(1)}/{m.group(2)}"
     
     return None
