@@ -327,73 +327,43 @@ if submitted:
                 else:
                     log("🤖 Executando cascade em modo Script...", level="step")
 
-                    # Try arXiv
-                    if use_arxiv:
-                        log("── [Tier 1] arXiv (Open Science) ──", level="step")
-                        arxiv_id = None
-                        query_text = qvalue
+                    # ── Normalize query so URLs/IDs are parsed before fetching ──
+                    from backend.cascade_fetcher import normalize_query
+                    norm_query, norm_arxiv_id, norm_doi = normalize_query(qvalue)
+                    if norm_arxiv_id:
+                        log(f"   🔎 Parsed arXiv ID: {norm_arxiv_id}")
+                    if norm_doi:
+                        log(f"   🔎 Parsed DOI: {norm_doi}")
 
-                        # Extract arXiv ID from URL
-                        if qtype == "link":
-                            match = re.search(r'arxiv\.org/(?:abs|arxiv/abs|PS_cache/arxiv)/(?:[^/]+/)?(\d+\.\d+)', qvalue)
-                            if match:
-                                arxiv_id = match.group(1)
-                                log(f"   Extracted arXiv ID: {arxiv_id}")
-                            else:
-                                query_text = qvalue  # use as query
-
-                        result = download_from_arxiv(
-                            query=query_text if not arxiv_id else None,
-                            arxiv_id=arxiv_id,
-                            max_results=max_results,
-                        )
-
-                        if result.success:
-                            downloaded_paths.extend(result.paths)
-                            st.session_state.stats["arxiv"] += len(result.paths)
-                            log(f"   ✅ arXiv: {len(result.paths)} arquivos baixados")
-                        else:
-                            log(f"   ⚠️ arXiv: {result.error}", level="step")
-
-                    # Try Anna's
-                    if use_annas and len(downloaded_paths) < max_results:
-                        log("── [Tier 2] Anna's Archive (Shadow Libraries) ──", level="step")
-                        result = download_from_annas_archive(
-                            query=qvalue,
-                            max_results=max_results - len(downloaded_paths),
-                            lang=lang_filter,
-                        )
-                        if result.success:
-                            downloaded_paths.extend(result.paths)
-                            st.session_state.stats["annas"] += len(result.paths)
-                            log(f"   ✅ Anna's: {len(result.paths)} arquivos baixados")
-                        else:
-                            log(f"   ⚠️ Anna's: {result.error}", level="step")
-
-                    # Try Sci-Hub (if DOI in query)
-                    if use_scihub:
-                        doi_match = re.search(r'(10\.\d{4,}/[^\s]+)', qvalue)
-                        if doi_match:
-                            log(f"── [Tier 2a] Sci-Hub (DOI detected) ──", level="step")
-                            result = download_from_scihub(doi=doi_match.group(1))
-                            if result.success:
-                                downloaded_paths.extend(result.paths)
-                                st.session_state.stats["scihub"] += 1
-                                log(f"   ✅ Sci-Hub: 1 arquivo baixado")
-
-                    # Try Web Search
-                    if use_web and len(downloaded_paths) < max_results:
-                        log("── [Tier 3] Web Search (Garimpo) ──", level="step")
-                        result = download_from_web_search(
-                            query=qvalue,
-                            max_results=max_results - len(downloaded_paths),
-                        )
-                        if result.success:
-                            downloaded_paths.extend(result.paths)
-                            st.session_state.stats["web"] += len(result.paths)
-                            log(f"   ✅ Web: {len(result.paths)} arquivos baixados")
-                        else:
-                            log(f"   ⚠️ Web: {result.error}", level="step")
+                    # Use run_cascade_script which handles the full cascade
+                    from backend.cascade_fetcher import run_cascade_script
+                    result = run_cascade_script(
+                        query=norm_query,
+                        arxiv_id=norm_arxiv_id,
+                        doi=norm_doi,
+                        preferred_source=None,
+                        max_results=max_results,
+                        lang=lang_filter,
+                        verbose=True,
+                    )
+                    if result.success:
+                        downloaded_paths = result.paths
+                        # Update stats by source
+                        src_counts = {}
+                        for p in result.paths:
+                            src = result.source or "script"
+                            src_counts[src] = src_counts.get(src, 0) + 1
+                        for src, cnt in src_counts.items():
+                            if src == "arxiv":
+                                st.session_state.stats["arxiv"] += cnt
+                            elif src in ("annas_archive", "Anna's Archive"):
+                                st.session_state.stats["annas"] += cnt
+                            elif src == "web_search":
+                                st.session_state.stats["web"] += cnt
+                            elif src == "scihub":
+                                st.session_state.stats["scihub"] += cnt
+                    if result.error:
+                        errors.append(result.error)
 
                 # ── Update stats ───────────────────────────────────────────
                 st.session_state.stats["total_downloaded"] += len(downloaded_paths)
