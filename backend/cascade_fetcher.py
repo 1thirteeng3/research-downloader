@@ -13,6 +13,7 @@ Each fetcher returns a FetchResult so the cascade always knows what succeeded, w
 """
 import time
 import re
+import requests
 from result import FetchResult
 from arxiv_fetcher import download_from_arxiv
 from shadow_scraper import download_from_annas_archive, download_from_scihub
@@ -23,49 +24,66 @@ from web_search_fetcher import download_from_web_search
 # URL / Query Normalization
 # ─────────────────────────────────────────────────────────
 
-# Match arXiv IDs inside URLs or plain:
-#   - 0801.3170, hep-th/9707234, math.DG/0611259, 2301.00012
-_ARXIV_URL_RE  = re.compile(r'(?:arxiv\.org/|abs/|pdf[/\.])(?:PS_cache/arxiv/)?(?:[\w.-]+/)?(\d{4}\.\d{4,5}(?:v\d+)?)')
-_DOI_RE        = re.compile(r'(?:https?://(?:dx\.)?doi\.org/|doi[:=]?)(10\.\d{4,9}/[^\s"\'#]+)', re.I)
-_SIMPLE_ARXIV_RE = re.compile(r'^(\d{4}\.\d{4,5}(?:v\d+)?)$')
+# arXiv new format (2004+): 4 digits . 4-5 digits [vN]
+_ARXIV_NEW_RE = re.compile(r'(?:arxiv\.org/(?:abs|pdf)|/)(\d{4}\.\d{4,5}(?:v\d+)?)', re.I)
+
+# arXiv legacy format (before 2007): category/DDDDDDD (7 digits)
+_ARXIV_LEGACY_URL_RE = re.compile(r'arxiv\.org/(?:abs|ps_cache/arxiv/)?([\w.-]+/\d{7,})', re.I)
+_ARXIV_LEGACY_BARE_RE = re.compile(r'^([\w.-]+/\d{7,})$')
+
+# DOI
+_DOI_RE = re.compile(r'(?:https?://(?:dx\.)?doi\.org/|doi[:=]?)\s*(10\.\d{4,9}/[^\s"\'#]+)', re.I)
+
+# Plain bare new-format ID: 0801.3170  (no category prefix)
+_SIMPLE_NEW_RE = re.compile(r'^(\d{4}\.\d{4,5}(?:v\d+)?)$')
+
 
 def normalize_query(raw: str) -> tuple[str, str, str]:
     """
-    Parse a raw input string that might be:
-      - A plain arXiv ID   : 0801.3170, hep-th/9707234
-      - A full arXiv URL   : http://arxiv.org/abs/0801.3170
-      - A PDF cache URL    : http://arxiv.org/PS_cache/arxiv/pdf/0805/0805.0157v4.pdf#page=12
-      - A DOI URL          : https://doi.org/10.1038/nature12373
-      - Free text query    : Integrated Information Theory
+    Parse any input (URL, bare ID, DOI, or free text) and return
+    (query, arxiv_id, doi).
 
-    Returns (query, arxiv_id, doi)
-      - arxiv_id is set ONLY when the input is a specific arXiv ID
-      - doi is set ONLY when the input is a specific DOI
-      - query is the cleaned free-text search (empty string if fully resolved above)
+    Handles:
+      - http://arxiv.org/abs/0801.3170        → arXiv ID: 0801.3170
+      - http://arxiv.org/abs/math.DG/0611259 → arXiv ID: math.DG/0611259 (legacy)
+      - http://arxiv.org/abs/hep-th/9707234   → arXiv ID: hep-th/9707234 (legacy)
+      - http://arxiv.org/PS_cache/.../0805.0157v4.pdf → arXiv ID: 0805.0157v4
+      - https://doi.org/10.1038/nature12373   → DOI: 10.1038/nature12373
+      - "Integrated Information Theory"       → query: Integrated Information Theory
     """
     raw = raw.strip()
     if not raw:
         return "", None, None
 
-    # Remove page anchors
-    url_clean = raw.split("#")[0]
+    # Strip page anchors (#page=N) and query params
+    url_clean = raw.split("#")[0].split("?")[0]
 
-    # 1. Extract arXiv ID from URL
-    m = _ARXIV_URL_RE.search(url_clean)
+    # 1. New-format arXiv ID (YYMM.NNNNN[vN]) — most URLs contain this
+    m = _ARXIV_NEW_RE.search(url_clean)
     if m:
         return "", m.group(1), None
 
-    # 2. Check if raw itself is a bare arXiv ID
-    m = _SIMPLE_ARXIV_RE.match(raw.replace("/", "").strip())
+    # 2. Legacy arXiv ID in URL (category/7digits)
+    m = _ARXIV_LEGACY_URL_RE.search(url_clean)
     if m:
-        return "", raw.strip(), None
+        return "", m.group(1), None
 
-    # 3. Extract DOI from URL
+    # 3. Legacy bare arXiv ID (category/7digits)
+    m = _ARXIV_LEGACY_BARE_RE.match(raw)
+    if m:
+        return "", m.group(1), None
+
+    # 4. Plain new-format bare ID (YYMM.NNNN[vN])
+    m = _SIMPLE_NEW_RE.match(raw.replace("/", ""))
+    if m:
+        return "", raw, None
+
+    # 5. DOI in any form
     m = _DOI_RE.search(url_clean)
     if m:
-        return "", None, m.group(1)
+        return "", None, m.group(1).rstrip("/")
 
-    # 4. Plain text query
+    # 6. Free text → use as search query
     return raw, None, None
 
 
@@ -80,116 +98,191 @@ def run_cascade_script(
     max_results: int = 3,
     lang: str = "",
     doi: str = None,
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> FetchResult:
     """
     Dumb script-mode cascade. No LLM needed.
     Tries sources in order until we hit max_results.
-
-    Args:
-        query        : Natural-language search term
-        arxiv_id     : Specific arXiv ID to fetch directly
-        preferred_source : Force only one source (skip cascade)
-        max_results  : Stop after this many files downloaded
-        lang         : Language filter for Anna's Archive
-        doi          : DOI → try Sci-Hub
-
-    Returns:
-        FetchResult with all paths collected across all tiers.
     """
-    if verbose:
-        print(f"\n  🤖 Executando cascade em modo Script...")
-
-    total_paths = []
+    all_paths = []
     errors = []
     items_found = 0
+    _tier_tried = set()
 
-    # ── Tier 1: arXiv (only if we have query or arxiv_id) ──
-    if preferred_source in (None, "arxiv") and (query or arxiv_id):
-        if verbose:
-            print(f"  ── [Tier 1] arXiv (Open Science) ──")
-        result = download_from_arxiv(query=query, arxiv_id=arxiv_id, max_results=max_results)
-        if result.success:
-            total_paths.extend(result.paths)
-            items_found += result.items_found
-            if verbose:
-                print(f"  ✅ arXiv: {len(result.paths)} papers downloaded")
-        else:
-            if verbose:
-                print(f"  ⚠️  arXiv: {result.error}")
-            errors.append(f"arXiv:{result.error}")
+    def _add(result: FetchResult):
+        nonlocal all_paths, items_found
+        if result.success and result.paths:
+            all_paths.extend(result.paths)
+            items_found += len(result.paths)
+        if result.error:
+            errors.append(result.error)
 
-    # ── Tier 1b: DOI / Sci-Hub ──
-    if doi and (not total_paths or preferred_source == "scihub"):
-        if verbose:
-            print(f"  ── [Tier 1b] Sci-Hub (DOI: {doi}) ──")
-        result = download_from_scihub(doi=doi, max_results=max_results)
-        if result.success:
-            total_paths.extend(result.paths)
-            items_found += result.items_found
-        else:
-            if verbose:
-                print(f"  ⚠️  Sci-Hub: {result.error}")
-            errors.append(f"SciHub:{result.error}")
+    # ── Tier 1: arXiv ──────────────────────────────────
+    if preferred_source != "annas_archive":
+        if arxiv_id or query:
+            _tier_tried.add("arxiv")
+            result = download_from_arxiv(query=query, arxiv_id=arxiv_id, max_results=max_results)
+            _add(result)
 
-    # Stop if we already have enough
-    if total_paths and len(total_paths) >= max_results:
-        return FetchResult(success=True, paths=total_paths, items_found=items_found,
-                           error="; ".join(errors), source="arxiv")
+    if len(all_paths) >= max_results:
+        return FetchResult(success=bool(all_paths), paths=all_paths,
+                           error="; ".join(errors) if errors else "", source="arxiv")
 
-    # ── Tier 2: Anna's Archive ──
-    if preferred_source in (None, "annas_archive") and not total_paths:
-        if verbose:
-            print(f"  ── [Tier 2] Anna's Archive (Shadow Libraries) ──")
-        search_term = query or arxiv_id or doi or ""
-        result = download_from_annas_archive(query=search_term, max_results=max_results - len(total_paths), lang=lang)
-        if result.success:
-            total_paths.extend(result.paths)
-            items_found += result.items_found
-            if verbose:
-                print(f"  ✅ Anna's: {len(result.paths)} files downloaded")
-        else:
-            if verbose:
-                print(f"  ⚠️  Anna's: {result.error}")
-            errors.append(f"Anna's:{result.error}")
+    # ── Tier 2a: Sci-Hub (if DOI) ───────────────────────
+    if doi:
+        _tier_tried.add("scihub")
+        result = download_from_scihub(doi=doi)
+        _add(result)
 
-    # ── Tier 3: Web Search / Garimpo ──
-    if not total_paths:
-        if verbose:
-            print(f"  ── [Tier 3] Web Search (Garimpo) ──")
-        search_term = query or arxiv_id or doi or ""
-        result = download_from_web_search(query=search_term, max_results=max_results)
-        if result.success:
-            total_paths.extend(result.paths)
-            items_found += result.items_found
-            if verbose:
-                print(f"  ✅ Web: {len(result.paths)} files found")
-        else:
-            if verbose:
-                print(f"  ⚠️  Web: {result.error}")
-            errors.append(f"Web:{result.error}")
+    if len(all_paths) >= max_results:
+        return FetchResult(success=bool(all_paths), paths=all_paths,
+                           error="; ".join(errors) if errors else "", source="scihub")
+
+    # ── Tier 2b: Anna's Archive / LibGen ────────────────
+    if preferred_source != "arxiv":
+        import shadow_scraper
+        shadow_scraper.verbose_fetching = verbose
+        _tier_tried.add("annas_archive")
+        search_q = (doi or arxiv_id or query or "").strip()
+        if search_q:
+            result = download_from_annas_archive(
+                query=search_q,
+                max_results=max_results - len(all_paths),
+                lang=lang,
+            )
+            _add(result)
+
+    if len(all_paths) >= max_results:
+        return FetchResult(success=bool(all_paths), paths=all_paths,
+                           error="; ".join(errors) if errors else "", source="annas_archive")
+
+    # ── Tier 3: Web Search / Garimpo ────────────────────
+    if query:
+        _tier_tried.add("web")
+        result = download_from_web_search(query=query, max_results=max_results - len(all_paths))
+        _add(result)
 
     return FetchResult(
-        success=bool(total_paths),
-        paths=total_paths,
-        items_found=items_found,
-        error="; ".join(errors),
-        source="script-cascade",
+        success=bool(all_paths),
+        paths=all_paths,
+        error=f"Tiers tried: {', '.join(_tier_tried)}. Errors: {'; '.join(errors)}" if errors else "",
+        source=" | ".join(_tier_tried) or "none",
     )
 
 
 # ─────────────────────────────────────────────────────────
-# ReAct Mode  (LLM-powered intelligent cascade)
+# ReAct Agent Mode
 # ─────────────────────────────────────────────────────────
 
-def _build_result(paths, errors, items_found, source):
-    return FetchResult(
-        success=bool(paths),
-        paths=paths,
-        items_found=items_found,
-        error="; ".join(e for e in errors if e),
-        source=source,
-    )
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "download_from_arxiv",
+            "description": (
+                "Download scientific papers from arXiv by search query or specific ID. "
+                "Use for: physics, math, CS, q-bio, q-fin, stats, EESS, economics papers. "
+                "arXiv ID formats: new='0801.3170', legacy='hep-th/9707234', 'math.DG/0611259'. "
+                "Pass arxiv_id= to fetch a specific paper; pass query= for keyword search."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":    {"type": "string", "description": "Keyword search (e.g. 'Integrated Information Theory IIT')"},
+                    "arxiv_id": {"type": "string", "description": "Specific arXiv ID (e.g. '0801.3170' or 'hep-th/9707234')"},
+                    "max_results": {"type": "integer", "description": "Max papers to download", "default": 5},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_from_annas_archive",
+            "description": (
+                "Search Anna's Archive and LibGen for books, seminars, humanities papers, "
+                "and any material not indexed on arXiv. Use for: Jacques Lacan seminars, "
+                "philosophy books, literature, obscure academic texts. "
+                "Returns FetchResult with paths on success."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string", "description": "Search query (e.g. 'Jacques Lacan Seminaire 1')"},
+                    "max_results": {"type": "integer", "description": "Max results to try downloading", "default": 3},
+                    "lang":        {"type": "string", "description": "Language filter (e.g. 'en', 'fr', 'pt')", "default": ""},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_from_scihub",
+            "description": (
+                "Download a scientific paper from Sci-Hub using its DOI. "
+                "Only use when you have a DOI (e.g. '10.1038/nature12373'). "
+                "arXiv papers do NOT have DOIs — use download_from_arxiv instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doi": {"type": "string", "description": "DOI of the paper (e.g. '10.1038/nature12373')"},
+                },
+                "required": ["doi"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_from_web_search",
+            "description": (
+                "LAST RESORT — Tier 3 'garimpo na web'. "
+                "Search the open web via DuckDuckGo for direct PDF/EPUB links. "
+                "Only use when the material is NOT on arXiv, Sci-Hub, or Anna's Archive. "
+                "Returns FetchResult with paths on success."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Max PDFs to attempt", "default": 3},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+SYSTEM_PROMPT = """You are the Research Cascade Agent — an expert librarian for scientific and academic materials.
+
+Your job: help the user find and download papers, books, and articles using a 3-tier cascade:
+
+  Tier 1 — arXiv        → Open Science (free, legal, fast). Use for: CS, physics, math, stats, engineering.
+  Tier 2 — Anna's/LibGen → Shadow Libraries. Use for: books, seminars, humanities, non-arXiv papers.
+  Tier 2b — Sci-Hub     → By DOI only. Use for: paywalled papers when DOI is available.
+  Tier 3 — Web Search   → LAST RESORT. Only when Tiers 1 and 2 both failed.
+
+STRICT RULES:
+  1. For arXiv papers: ALWAYS use download_from_arxiv (NOT web search).
+  2. For books/seminars (e.g. Lacan): use download_from_annas_archive.
+  3. For DOIs: use download_from_scihub.
+  4. Web Search is a last resort only.
+  5. After each tool call, analyse the result:
+       - If success (paths returned): report to the user and stop.
+       - If failure: try the next tier in the cascade.
+  6. Stop when you have >= max_results files or when all tiers are exhausted.
+  7. For URL inputs like 'http://arxiv.org/abs/hep-th/9707234': extract the ID first, then call the appropriate fetcher.
+  8. For legacy arXiv IDs like 'math.DG/0611259' or 'hep-th/9707234': pass them as arxiv_id to download_from_arxiv.
+
+After each tool call, think: Did it succeed? Should I try next tier or stop?
+"""
 
 
 def run_cascade_react(
@@ -197,239 +290,141 @@ def run_cascade_react(
     api_key: str,
     model: str = "gpt-4o",
     max_results: int = 3,
-    lang: str = "",
-    verbose: bool = True,
+    verbose: bool = False,
 ) -> FetchResult:
     """
-    ReAct loop.  The LLM gets tool definitions and decides
-    when/what to call.  Handles arXiv IDs, DOIs, and free-text
-    queries by parsing the input in the system prompt.
+    ReAct loop: the LLM plans actions, executes tools, and loops until done.
+    Uses openai SDK directly.
     """
     try:
         from openai import OpenAI
     except ImportError:
-        return FetchResult(success=False, error="openai package not installed. Run: pip install openai")
+        return FetchResult(False, [], "openai package not installed. Run: pip install openai")
 
     client = OpenAI(api_key=api_key)
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "download_from_arxiv",
-                "description": (
-                    "Download papers from arXiv by query or specific ID.  "
-                    "ALWAYS try this first for physics, math, CS, q-bio, q-fin, stats, eess.  "
-                    "If the user gave a URL like 'http://arxiv.org/abs/0801.3170', "
-                    "use the numeric ID '0801.3170' as the arxiv_id argument.  "
-                    "If the user gave a PDF cache URL, extract the numeric ID from it."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query":    {"type": "string", "description": "Natural-language search (e.g. 'Integrated Information Theory'). Use when user gave free text."},
-                        "arxiv_id": {"type": "string", "description": "Specific arXiv ID (e.g. '0801.3170'). Use when user gave a URL or bare ID."},
-                        "max_results": {"type": "integer", "description": "Max papers to download.", "default": 3},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "download_from_annas_archive",
-                "description": (
-                    "Download books / seminars / articles from Anna's Archive.  "
-                    "Use when arXiv fails OR when the user is looking for books, "
-                    "humanities, literature, or non-CSS papers.  "
-                    "For Lacan seminars: query='Jacques Lacan Seminaire', lang='fr'."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query":      {"type": "string", "description": "Search term."},
-                        "max_results": {"type": "integer", "description": "Max books to download.", "default": 3},
-                        "lang":        {"type": "string", "description": "Language code (en, fr, es, pt...)."},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "download_from_scihub",
-                "description": "Download a paper via DOI using Sci-Hub. Use when user provides a DOI or a URL like https://doi.org/10.xxx.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "doi":        {"type": "string", "description": "DOI (e.g. '10.1038/nature12373')."},
-                        "max_results": {"type": "integer", "description": "Max papers.", "default": 3},
-                    },
-                    "required": ["doi"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "download_from_web_search",
-                "description": (
-                    "Last-resort catch-all. Search the web via DuckDuckGo for direct PDF/EPUB links.  "
-                    "Only call this after arXiv, Anna's Archive, and Sci-Hub have all failed."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query":       {"type": "string", "description": "Search query (title, topic, author...)."},
-                        "max_results": {"type": "integer", "description": "Max results.", "default": 3},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-    ]
+    # Pre-normalize the user's raw input
+    clean_query, pre_arxiv_id, pre_doi = normalize_query(query)
 
     messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
         {
-            "role": "system",
+            "role": "user",
             "content": (
-                "You are a world-class research assistant with access to these tools:\n"
-                "  - download_from_arxiv(query, arxiv_id, max_results)\n"
-                "  - download_from_annas_archive(query, max_results, lang)\n"
-                "  - download_from_scihub(doi, max_results)\n"
-                "  - download_from_web_search(query, max_results)\n\n"
-                "IMPORTANT — URL / ID parsing rules (apply BEFORE calling any tool):\n"
-                "  • http://arxiv.org/abs/0801.3170  → arxiv_id='0801.3170'\n"
-                "  • http://arxiv.org/PS_cache/arxiv/pdf/0805/0805.0157v4.pdf → arxiv_id='0805.0157'\n"
-                "  • https://doi.org/10.1038/nature12373 → doi='10.1038/nature12373'\n"
-                "  • Plain '0801.3170'               → arxiv_id='0801.3170'\n"
-                "  • Plain 'hep-th/9707234'           → arxiv_id='hep-th/9707234'\n"
-                "  • Free text like 'IIT Tononi'      → query='Integrated Information Theory Tononi'\n\n"
-                "Strategy rules:\n"
-                "  1. For physics/math/CS papers → ALWAYS try arXiv first.\n"
-                "  2. For books, seminars, humanities → try Anna's Archive.\n"
-                "  3. For DOIs → try Sci-Hub.\n"
-                "  4. Web Search → ONLY as last resort.\n"
-                "  5. Stop and return a summary when you have ≥ max_results files.\n"
-                "  6. If any tool returns no results, try the next tier.\n"
-                "  7. When the user gives many URLs at once (batch), parse ALL of them and call the appropriate tool for each one.\n"
+                f"Download up to {max_results} file(s) about: {query!r}\n"
+                + (f" (pre-extracted arXiv ID: {pre_arxiv_id})" if pre_arxiv_id else "")
+                + (f" (pre-extracted DOI: {pre_doi})" if pre_doi else "")
+                + "\nStart by calling the most appropriate tool."
             ),
         },
-        {"role": "user", "content": query},
     ]
 
     total_paths = []
     errors = []
     items_found = 0
+    max_turns = 15
+    last_reasoning = ""
 
-    if verbose:
-        print(f"  🤖 ReAct Agent inicializado (modelo: {model})")
-
-    for step in range(10):   # max 10 ReAct steps to prevent runaway
+    for turn in range(max_turns):
         if verbose:
-            print(f"\n  ── ReAct Step {step+1} ──")
+            print(f"\n  🔄 ReAct turn {turn + 1}/{max_turns}")
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-        )
+        # ── LLM decides next action ──────────────────────
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+                temperature=0.1,
+            )
+        except Exception as e:
+            errors.append(f"OpenAI API error: {e}")
+            break
 
         message = response.choices[0].message
 
+        # ── No tool call — agent is done ─────────────────
         if not message.tool_calls:
-            # Agent done
-            if verbose:
-                print(f"  ✅ Agente terminou: {message.content}")
+            if message.content:
+                last_reasoning = message.content
+                if verbose:
+                    print(f"  🤖 Agent: {message.content}")
             break
 
+        # ── Execute each tool call ───────────────────────
         for tool_call in message.tool_calls:
             fn_name = tool_call.function.name
             args_str = tool_call.function.arguments
-
             if verbose:
-                print(f"  ⚡ Tool: {fn_name} | args: {args_str[:120]}")
+                print(f"  ⚡ Tool: {fn_name} — {args_str[:200]}")
 
+            # ── Parse arguments safely ─────────────────
             try:
-                args = eval(f"dict({args_str})", {"__builtins__": {}}, {})
+                args = {"max_results": max_results}
+                args.update(eval(f"dict({args_str})"))
             except Exception:
                 try:
                     import json
                     args = json.loads(args_str)
-                except Exception as e:
-                    if verbose:
-                        print(f"  ❌ Failed to parse args: {e}")
-                    errors.append(f"{fn_name}:parse-error")
+                except Exception:
+                    errors.append(f"Failed to parse args for {fn_name}: {args_str}")
                     continue
 
-            # ── Route tool call ──
+            # Override max_results to respect user preference
+            args["max_results"] = min(args.get("max_results", max_results), max_results)
+
+            # Pre-fill arxiv_id if we extracted one from the URL
+            if fn_name == "download_from_arxiv" and pre_arxiv_id and not args.get("arxiv_id"):
+                args["arxiv_id"] = pre_arxiv_id
+                if verbose:
+                    print(f"     ↳ Injected pre-extracted arXiv ID: {pre_arxiv_id}")
+
+            # Pre-fill DOI if we extracted one
+            if fn_name == "download_from_scihub" and pre_doi and not args.get("doi"):
+                args["doi"] = pre_doi
+
+            # ── Route to correct fetcher ─────────────────
+            result: FetchResult = FetchResult(False, [], f"Unknown tool: {fn_name}")
             if fn_name == "download_from_arxiv":
-                result = download_from_arxiv(
-                    query=args.get("query"),
-                    arxiv_id=args.get("arxiv_id"),
-                    max_results=args.get("max_results", max_results),
-                )
-                items_found += result.items_found
-
+                result = download_from_arxiv(**{k: v for k, v in args.items() if k in ("query", "arxiv_id", "max_results")})
             elif fn_name == "download_from_annas_archive":
-                result = download_from_annas_archive(
-                    query=args.get("query"),
-                    max_results=args.get("max_results", max_results),
-                    lang=args.get("lang", lang),
-                )
-                items_found += result.items_found
-
+                result = download_from_annas_archive(**{k: v for k, v in args.items() if k in ("query", "max_results", "lang")})
             elif fn_name == "download_from_scihub":
-                result = download_from_scihub(
-                    doi=args.get("doi"),
-                    max_results=args.get("max_results", max_results),
-                )
-                items_found += result.items_found
-
+                result = download_from_scihub(**{k: v for k, v in args.items() if k in ("doi",)})
             elif fn_name == "download_from_web_search":
-                result = download_from_web_search(
-                    query=args.get("query"),
-                    max_results=args.get("max_results", max_results),
-                )
-                items_found += result.items_found
+                result = download_from_web_search(**{k: v for k, v in args.items() if k in ("query", "max_results")})
 
-            else:
-                result = FetchResult(success=False, error=f"Unknown tool: {fn_name}")
-
-            if result.paths:
+            # ── Record result ───────────────────────────
+            if result.success and result.paths:
                 total_paths.extend(result.paths)
-
+                items_found += len(result.paths)
             if result.error:
                 errors.append(result.error)
 
-            # ── Give tool result back to LLM ──
+            # ── Report back to LLM ──────────────────────
             result_summary = (
-                f"success={result.success}, "
-                f"paths={result.paths}, "
+                f"FetchResult(success={result.success}, "
+                f"paths={result.paths!r}, "
                 f"error={result.error!r}, "
                 f"source={result.source!r}, "
-                f"items_found={result.items_found}"
+                f"items_found={items_found})"
             )
-            messages.append({"role": "assistant", "content": message.content})
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result_summary,
-            })
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result_summary})
 
-            if total_paths and len(total_paths) >= max_results:
-                if verbose:
-                    print(f"  ✅ Atingiu {len(total_paths)} resultados. Parando.")
-                return _build_result(total_paths, errors, items_found, "react")
+            if verbose:
+                print(f"     ↳ Result: {result_summary[:300]}")
 
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"  🧠 ReAct completo. Baixados {len(total_paths)}/{max_results} arquivos.")
-        if errors:
-            print(f"  ⚠️  Erros: {' | '.join(set(errors))}")
-        print(f"{'='*60}\n")
+            # Stop if we have enough
+            if len(total_paths) >= max_results:
+                break
 
-    return _build_result(total_paths, errors, items_found, "react")
+        if len(total_paths) >= max_results:
+            break
+
+    return FetchResult(
+        success=bool(total_paths),
+        paths=total_paths,
+        error=f"Turns: {turn+1}. Errors: {' | '.join(errors)}" if errors else "",
+        source="react",
+    )
