@@ -28,7 +28,7 @@ from web_search_fetcher import download_from_web_search
 _ARXIV_NEW_RE = re.compile(r'(?:arxiv\.org/(?:abs|pdf)|/)(\d{4}\.\d{4,5}(?:v\d+)?)', re.I)
 
 # arXiv legacy format (before 2007): category/DDDDDDD (7 digits)
-_ARXIV_LEGACY_URL_RE = re.compile(r'arxiv\.org/(?:abs|ps_cache/arxiv/)?([\w.-]+/\d{7,})', re.I)
+_ARXIV_LEGACY_URL_RE = re.compile(r'(?:arxiv\.org|aps\.arxiv\.org)/(?:abs|ps_cache/arxiv/)?([\w.-]+/\d{7,})', re.I)
 _ARXIV_LEGACY_BARE_RE = re.compile(r'^([\w.-]+/\d{7,})$')
 
 # DOI
